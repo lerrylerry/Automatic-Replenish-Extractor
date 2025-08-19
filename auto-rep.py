@@ -1,82 +1,65 @@
-import re
 import pandas as pd
-from rapidfuzz import process, fuzz
+import re
 import math
 
-# File paths
-template_file = "template.xlsx"
-extract_file = "extract.xlsx"
-output_file = "order_result.xlsx"
+# --- File paths ---
+first_file = "extract.xlsx"     # DESCRIPTION | INVENTORY
+second_file = "template.xlsx"   # DESCRIPTION | ALLOCATION | INVENTORY | ORDERING
+output_file = "reconciliation.xlsx"
 
-# Load excels
-df_template = pd.read_excel(template_file)  # Has Description, Allocation (boxes/pieces)
-df_extract = pd.read_excel(extract_file)    # Has Description, Current_Stock (pcs)
+# --- Load excels ---
+df_first = pd.read_excel(first_file)
+df_second = pd.read_excel(second_file)
 
-print("Template Columns:", df_template.columns.tolist())
-print("Extract Columns:", df_extract.columns.tolist())
+# --- Normalize descriptions ---
+def normalize_desc(s: str) -> str:
+    if pd.isna(s): return ""
+    s = str(s).upper().strip()
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-# Normalize text for comparison
-df_template['Description_norm'] = df_template['DESCRIPTION'].str.lower().str.strip()
-df_extract['Description_norm'] = df_extract['DESCRIPTION'].str.lower().str.strip()
+df_first["DESC_KEY"] = df_first["DESCRIPTION"].map(normalize_desc)
+df_second["DESC_KEY"] = df_second["DESCRIPTION"].map(normalize_desc)
 
-# Fuzzy match function
-def best_match(desc, choices):
-    match, score, idx = process.extractOne(desc, choices, scorer=fuzz.token_sort_ratio)
-    return match, score
-
-matches = []
-for i, row in df_extract.iterrows():
-    match, score = best_match(row['Description_norm'], df_template['Description_norm'].tolist())
-    matches.append((row['DESCRIPTION'], match, score, row['INVENTORY']))
-
-df_map = pd.DataFrame(matches, columns=['NEW DESCRIPTION', 'Template_Desc', 'Score', 'CURRENT STOCK'])
-df_merge = df_map.merge(df_template, left_on="Template_Desc", right_on="Description_norm", how="left")
-
-# Function: detect pcs per box
-def get_pieces_per_box(desc):
-    desc_lower = desc.lower()
-    # Syrup or ml means count = 1 piece
-    if "syrup" in desc_lower or "ml" in desc_lower or "syr" in desc_lower:
-        return 1
-    # Try to detect number of tablets/caps
-    m = re.search(r'(\d+)\s*(tabs?|caps?|s)', desc_lower)
-    if m:
-        return int(m.group(1))
-    return 1  # fallback if nothing found
-
-df_merge['PIECES FOR BOX'] = df_merge['NEW DESCRIPTION'].apply(get_pieces_per_box)
-
-# Business logic for order calculation
-def compute_order(current_stock, allocation_boxes, pieces_per_box):
-    if pd.isna(allocation_boxes) or allocation_boxes == 0 or pieces_per_box == 0:
-        return None  # needs manual audit
-
-    # Convert stock into boxes (or pieces if syrup)
-    boxes_available = current_stock / pieces_per_box
-
-    # If below allocation, check tolerance
-    if boxes_available < allocation_boxes:
-        needed_pieces = allocation_boxes * pieces_per_box
-        if current_stock <= (needed_pieces - 25):  # tolerance 25 pcs
-            return allocation_boxes - math.floor(boxes_available)
-        else:
-            return 0
-
-    return 0  # already enough
-
-df_merge['ORDER_QUANTITY'] = df_merge.apply(
-    lambda x: compute_order(x['CURRENT STOCK'], x['ALLOCATION'], x['PIECES FOR BOX']), axis=1
+# --- Merge inventory from first into second ---
+df_merged = df_second.merge(
+    df_first[["DESC_KEY", "INVENTORY"]].rename(columns={"INVENTORY": "INVENTORY_FIRST"}),
+    on="DESC_KEY",
+    how="left"
 )
 
-# Flag mixed medicines
-df_merge['MANUAL AUDIT'] = df_merge['NEW DESCRIPTION'].apply(
-    lambda d: "Yes" if "+" in d or "/" in d else "No"
+# Replace INVENTORY with first file’s if available
+df_merged["INVENTORY"] = df_merged["INVENTORY_FIRST"].fillna(df_merged["INVENTORY"])
+
+# --- Allocation rule (box = 100 pcs, syrup = per piece) ---
+def compute_order(desc, alloc, inv):
+    if pd.isna(alloc) or pd.isna(inv):
+        return 0
+
+    desc_upper = str(desc).upper()
+
+    if "SYRUP" in desc_upper or "ML" in desc_upper:  
+        pieces_per_alloc = 1   # syrup/ml by piece
+    else:
+        pieces_per_alloc = 100 # default: box = 100 pcs
+
+    needed_pcs = alloc * pieces_per_alloc
+    gap = needed_pcs - inv
+
+    if gap <= 0:
+        return 0
+
+    return math.ceil(gap / pieces_per_alloc)
+
+df_merged["ORDERING"] = df_merged.apply(
+    lambda x: compute_order(x["DESCRIPTION"], x["ALLOCATION"], x["INVENTORY"]), axis=1
 )
 
-# Save final result
-df_merge[['NEW DESCRIPTION', 'ALLOCATION', 'CURRENT STOCK', 'ORDER_QUANTITY', 'MANUAL AUDIT']].to_excel(output_file, index=False)
+# --- Keep only the same format as second file ---
+df_result = df_merged[["DESCRIPTION", "ALLOCATION", "INVENTORY", "ORDERING"]]
 
-'''
-df_merge[['NEW DESCRIPTION', 'ALLOCATION', 'CURRENT STOCK', 'PIECES FOR BOX', 'ORDER_QUANTITY', 'MANUAL AUDIT']].to_excel(output_file, index=False)
-'''
-print("✅ Processing complete! Check:", output_file)
+# --- Save final result ---
+df_result.to_excel(output_file, index=False)
+
+print(f"✅ Done! Output saved as {output_file}")
