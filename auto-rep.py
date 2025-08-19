@@ -1,11 +1,8 @@
 import pandas as pd
 import re
 import math
-
-# ==== CONFIG ====
-FILE_ALLOCATION = "template.xlsx"  # first Excel: Col A=Description, Col B=Allocation (boxes/bottles)
-FILE_INVENTORY  = "extract.xlsx"   # second Excel: Col A=Description, Col B=Inventory (pieces/bottles)
-FILE_OUTPUT     = "output.xlsx"
+import streamlit as st
+import io
 
 # ==== HELPERS ====
 SOLID_FORMS = {
@@ -114,106 +111,129 @@ def is_unclear_pack(s: str) -> bool:
     s = norm_text(s)
     return any(kw in s for kw in ["pwdr", "soln", "solution", "powder"])
 
-# ==== READ FILES ====
-dfa = pd.read_excel(FILE_ALLOCATION, usecols=[0,1])
-dfa.columns = ["Description", "Allocation"]
 
-dfb = pd.read_excel(FILE_INVENTORY, usecols=[0,1])
-dfb.columns = ["Description", "Inventory"]
+# ==== STREAMLIT UI ====
+st.title("📦 Automatic Replenish Extractor")
 
-dfb["Inventory"] = dfb["Inventory"].apply(safe_int)
+file_allocation = st.file_uploader("Upload Template Excel", type=["xlsx"])
+file_inventory = st.file_uploader("Upload Extract Excel", type=["xlsx"])
 
-# Pre-compute parsed features
-dfa["norm"] = dfa["Description"].apply(norm_text)
-dfa["strength"] = dfa["Description"].apply(extract_strength)
-dfa["form_family"] = dfa["Description"].apply(detect_form_family)
-dfa[["pack", "pack_complex"]] = dfa["Description"].apply(lambda s: pd.Series(extract_pack(s)))
-dfa["root"] = dfa["Description"].apply(primary_generic_root)
+if file_allocation and file_inventory:
+    # ==== READ FILES ====
+    dfa = pd.read_excel(file_allocation, usecols=[0,1])
+    dfa.columns = ["Description", "Allocation"]
 
-dfb["norm"] = dfb["Description"].apply(norm_text)
-dfb["strength"] = dfb["Description"].apply(extract_strength)
-dfb["form_family"] = dfb["Description"].apply(detect_form_family)
-dfb[["pack", "pack_complex"]] = dfb["Description"].apply(lambda s: pd.Series(extract_pack(s)))
-dfb["root"] = dfb["Description"].apply(primary_generic_root)
+    dfb = pd.read_excel(file_inventory, usecols=[0,1])
+    dfb.columns = ["Description", "Inventory"]
 
-rows = []
+    dfb["Inventory"] = dfb["Inventory"].apply(safe_int)
 
-for idx, A in dfa.iterrows():
-    alloc = safe_int(A["Allocation"])
-    a_desc = A["Description"]
-    a_norm = A["norm"]
-    a_root = A["root"]
-    a_strength = A["strength"]
-    a_formfam = A["form_family"]
-    a_pack, a_complex = A["pack"], A["pack_complex"]
+    # Pre-compute parsed features
+    dfa["norm"] = dfa["Description"].apply(norm_text)
+    dfa["strength"] = dfa["Description"].apply(extract_strength)
+    dfa["form_family"] = dfa["Description"].apply(detect_form_family)
+    dfa[["pack", "pack_complex"]] = dfa["Description"].apply(lambda s: pd.Series(extract_pack(s)))
+    dfa["root"] = dfa["Description"].apply(primary_generic_root)
 
-    remarks = []
+    dfb["norm"] = dfb["Description"].apply(norm_text)
+    dfb["strength"] = dfb["Description"].apply(extract_strength)
+    dfb["form_family"] = dfb["Description"].apply(detect_form_family)
+    dfb[["pack", "pack_complex"]] = dfb["Description"].apply(lambda s: pd.Series(extract_pack(s)))
+    dfb["root"] = dfb["Description"].apply(primary_generic_root)
 
-    # --- Candidate selection ---
-    cand = dfb[
-        (dfb["Inventory"] > 0) &
-        (dfb["form_family"] == a_formfam) &
-        (dfb["strength"] == a_strength) &
-        (dfb["root"].str.contains(a_root.split()[0] if a_root else "", na=False)) &
-        (dfb["norm"].str.contains(a_root.split()[0] if a_root else "", na=False)) &
-        (dfb["norm"].apply(lambda s: same_combo_pattern(a_norm, s)))
-    ].copy()
+    rows = []
 
-    if cand.empty:
-        fw = (a_root.split()[0] if a_root else "")
-        if fw:
-            cand = dfb[
-                (dfb["Inventory"] > 0) &
-                (dfb["form_family"] == a_formfam) &
-                (dfb["strength"] == a_strength) &
-                (dfb["norm"].str.contains(fw))
-            ].copy()
+    for idx, A in dfa.iterrows():
+        alloc = safe_int(A["Allocation"])
+        a_desc = A["Description"]
+        a_norm = A["norm"]
+        a_root = A["root"]
+        a_strength = A["strength"]
+        a_formfam = A["form_family"]
+        a_pack, a_complex = A["pack"], A["pack_complex"]
 
-    if cand.empty:
-        rows.append([a_desc, alloc, 0, alloc, "No match found"])
-        continue
+        remarks = []
 
-    total_inventory_pieces = int(sum([safe_int(x) for x in cand["Inventory"]]))
+        # --- Candidate selection ---
+        cand = dfb[
+            (dfb["Inventory"] > 0) &
+            (dfb["form_family"] == a_formfam) &
+            (dfb["strength"] == a_strength) &
+            (dfb["root"].str.contains(a_root.split()[0] if a_root else "", na=False)) &
+            (dfb["norm"].str.contains(a_root.split()[0] if a_root else "", na=False)) &
+            (dfb["norm"].apply(lambda s: same_combo_pattern(a_norm, s)))
+        ].copy()
 
-    # --- Exact vs Fuzzy match detection ---
-    if any(cand["norm"] == a_norm):
-        remarks.append("Exact Match")
-    else:
-        remarks.append("Alternatives found")
+        if cand.empty:
+            fw = (a_root.split()[0] if a_root else "")
+            if fw:
+                cand = dfb[
+                    (dfb["Inventory"] > 0) &
+                    (dfb["form_family"] == a_formfam) &
+                    (dfb["strength"] == a_strength) &
+                    (dfb["norm"].str.contains(fw))
+                ].copy()
 
-    # --- Extra remarks from audit rules ---
-    if any(cand["pack_complex"]) or a_complex:
-        remarks.append("Audit pack: complex count")
-    if any(cand["pack"].isna()) and a_formfam == "solid":
-        remarks.append("Check pack size")
-    if cand.shape[0] > 1:
-        remarks.append("Combined multiple brands")
-    if any(cand["norm"].apply(lambda s: cap_tab_mismatch(a_norm, s))):
-        remarks.append("Capsule vs Tablet; review")
-    if is_unclear_pack(a_desc):
-        remarks.append("Unclear pack (Pwdr/Soln); needs checking")
+        if cand.empty:
+            rows.append([a_desc, alloc, 0, alloc, "No match found"])
+            continue
 
-    # --- Remaining computation ---
-    remaining = 0
-    if a_formfam == "solid":
-        if a_pack is None:
-            remaining = alloc
-            remarks.append("Check pack size")
+        total_inventory_pieces = int(sum([safe_int(x) for x in cand["Inventory"]]))
+
+        # --- Exact vs Fuzzy match detection ---
+        if any(cand["norm"] == a_norm):
+            remarks.append("Exact Match")
         else:
-            need_float = alloc - (float(total_inventory_pieces) / float(a_pack))
+            remarks.append("Alternatives found")
+
+        # --- Extra remarks from audit rules ---
+        if any(cand["pack_complex"]) or a_complex:
+            remarks.append("Audit pack: complex count")
+        if any(cand["pack"].isna()) and a_formfam == "solid":
+            remarks.append("Check pack size")
+        if cand.shape[0] > 1:
+            remarks.append("Combined multiple brands")
+        if any(cand["norm"].apply(lambda s: cap_tab_mismatch(a_norm, s))):
+            remarks.append("Capsule vs Tablet; review")
+        if is_unclear_pack(a_desc):
+            remarks.append("Unclear pack (Pwdr/Soln); needs checking")
+
+        # --- Remaining computation ---
+        remaining = 0
+        if a_formfam == "solid":
+            if a_pack is None:
+                remaining = alloc
+                remarks.append("Check pack size")
+            else:
+                need_float = alloc - (float(total_inventory_pieces) / float(a_pack))
+                need_float = max(0.0, need_float)
+                remaining = round_half_up(need_float)
+        else:
+            need_float = alloc - float(total_inventory_pieces)
             need_float = max(0.0, need_float)
             remaining = round_half_up(need_float)
-    else:
-        need_float = alloc - float(total_inventory_pieces)
-        need_float = max(0.0, need_float)
-        remaining = round_half_up(need_float)
 
-    if remaining < 0:
-        remaining = 0
+        if remaining < 0:
+            remaining = 0
 
-    remarks_str = "; ".join(sorted(set(remarks))) if remarks else ""
-    rows.append([a_desc, alloc, total_inventory_pieces, remaining, remarks_str])
+        remarks_str = "; ".join(sorted(set(remarks))) if remarks else ""
+        rows.append([a_desc, alloc, total_inventory_pieces, remaining, remarks_str])
 
-out = pd.DataFrame(rows, columns=["Description", "Allocation", "Inventory", "Remaining", "Remarks"])
-out.to_excel(FILE_OUTPUT, index=False)
-print(f"✅ Done. Wrote {FILE_OUTPUT}")
+    out = pd.DataFrame(rows, columns=["Description", "Allocation", "Inventory", "Remaining", "Remarks"])
+
+    st.success("✅ Processing complete!")
+
+    # Preview
+    st.dataframe(out)
+
+    # Download
+    buffer = io.BytesIO()
+    out.to_excel(buffer, index=False)
+    buffer.seek(0)
+
+    st.download_button(
+        label="📥 Download Output Excel",
+        data=buffer,
+        file_name="output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
