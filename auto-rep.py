@@ -159,21 +159,25 @@ if file_allocation and file_inventory:
             (dfb["Inventory"] > 0) &
             (dfb["form_family"] == a_formfam) &
             (dfb["strength"] == a_strength) &
-            (dfb["root"].str.contains(a_root.split()[0] if a_root else "", na=False)) &
-            (dfb["norm"].str.contains(a_root.split()[0] if a_root else "", na=False)) &
+            (dfb["root"] == a_root) &
+            (
+                (dfb["pack"] == a_pack) |
+                (pd.isna(dfb["pack"]) & pd.isna(a_pack))
+            ) &
             (dfb["norm"].apply(lambda s: same_combo_pattern(a_norm, s)))
         ].copy()
 
-        if cand.empty:
-            fw = (a_root.split()[0] if a_root else "")
-            if fw:
-                cand = dfb[
-                    (dfb["Inventory"] > 0) &
-                    (dfb["form_family"] == a_formfam) &
-                    (dfb["strength"] == a_strength) &
-                    (dfb["norm"].str.contains(fw))
-                ].copy()
+        # If combo product, leave for audit
+        if is_combo_product(a_norm):
+            rows.append([a_desc, alloc, 0, alloc, "Combo product; audit"])
+            continue
 
+        # If multiple inventory matches, leave for audit
+        if cand.shape[0] > 1:
+            rows.append([a_desc, alloc, 0, alloc, "Multiple inventory matches; audit"])
+            continue
+
+        # If no strict match, leave for audit
         if cand.empty:
             rows.append([a_desc, alloc, 0, alloc, "No match found"])
             continue
@@ -191,8 +195,6 @@ if file_allocation and file_inventory:
             remarks.append("Audit pack: complex count")
         if any(cand["pack"].isna()) and a_formfam == "solid":
             remarks.append("Check pack size")
-        if cand.shape[0] > 1:
-            remarks.append("Combined multiple brands")
         if any(cand["norm"].apply(lambda s: cap_tab_mismatch(a_norm, s))):
             remarks.append("Capsule vs Tablet; review")
         if is_unclear_pack(a_desc):
