@@ -15,16 +15,15 @@ LIQUID_TOPICAL_FORMS = {
     "cream", "ointment", "spray", "nebule", "inhaler", "solution", "soln", "gel", "lotion"
 }
 
+# Round half up
 def round_half_up(x: float) -> int:
-    if x <= 0:
-        return 0
+    if x <= 0: return 0
     return int(math.floor(x + 0.5))
 
 def safe_int(x):
     try:
         v = float(x)
-        if v < 0 or pd.isna(v):
-            return 0
+        if v < 0 or pd.isna(v): return 0
         return int(v) if float(v).is_integer() else float(v)
     except:
         return 0
@@ -59,32 +58,25 @@ def extract_strength(s: str):
     if m:
         num, unit = m.group(1), m.group(2)
         if unit == "g":
-            try:
-                num = str(float(num) * 1000.0)
-                unit = "mg"
-            except:
-                pass
+            try: num = str(float(num)*1000.0); unit="mg"
+            except: pass
         return f"{num}{unit}"
     m2 = re.search(r"(\d+(?:\.\d+)?)\s*mg\/?(?:ml|mL)", s)
-    if m2:
-        return f"{m2.group(1)}mg/ml"
+    if m2: return f"{m2.group(1)}mg/ml"
     return ""
 
 def extract_pack(s: str):
-    s0 = s
     s = norm_text(s)
     if re.search(r"\b\d+\s*[x×]\s*\d+\b", s) or re.search(r"\bbxs?\b.*[x×].*\d", s):
         return None, True
     m = re.search(r"\b(\d+)\s*'?s\b", s)
     if m:
-        try:
-            return int(m.group(1)), False
-        except:
-            return None, False
+        try: return int(m.group(1)), False
+        except: return None, False
     return None, False
 
 def is_combo_product(s: str) -> bool:
-    return "+" in s
+    return any(x in s for x in ["+", "&", "with"])
 
 def primary_generic_root(s: str) -> str:
     s = norm_text(s)
@@ -92,25 +84,24 @@ def primary_generic_root(s: str) -> str:
     toks = [t for t in cut.split() if t not in {"film", "coated"}]
     return " ".join(toks[:2]) if toks else s
 
-def same_combo_pattern(a: str, b: str) -> bool:
-    return is_combo_product(a) == is_combo_product(b)
+def same_combo_exact(a: str, b: str) -> bool:
+    a_set = set(a.lower().split("+"))
+    b_set = set(b.lower().split("+"))
+    return a_set == b_set
 
 def cap_tab_mismatch(a: str, b: str) -> bool:
     at = set(norm_text(a).split())
     bt = set(norm_text(b).split())
     a_form = ("tablet" in at or "tab" in at) or ("capsule" in at or "cap" in at)
     b_form = ("tablet" in bt or "tab" in bt) or ("capsule" in bt or "cap" in bt)
-    if not (a_form and b_form):
-        return False
+    if not (a_form and b_form): return False
     a_is_tab = ("tablet" in at or "tab" in at)
     b_is_tab = ("tablet" in bt or "tab" in bt)
     return a_is_tab != b_is_tab
 
 def is_unclear_pack(s: str) -> bool:
-    """Mark products like Pwdr or Soln as unclear pack size."""
     s = norm_text(s)
     return any(kw in s for kw in ["pwdr", "soln", "solution", "powder"])
-
 
 # ==== STREAMLIT UI ====
 st.title("📦 Automatic Replenish Extractor")
@@ -119,33 +110,38 @@ file_allocation = st.file_uploader("Upload Template Excel", type=["xlsx"])
 file_inventory = st.file_uploader("Upload Extract Excel", type=["xlsx"])
 
 if file_allocation and file_inventory:
-    # ==== READ FILES ====
-    dfa = pd.read_excel(file_allocation, usecols=[0,1])
-    dfa.columns = ["Description", "Allocation"]
+    dfa = pd.read_excel(file_allocation)
+    dfb = pd.read_excel(file_inventory)
 
-    dfb = pd.read_excel(file_inventory, usecols=[0,1])
-    dfb.columns = ["Description", "Inventory"]
+    # Auto-detect columns
+    def detect_col(df, key):
+        for c in df.columns:
+            if key in c.lower(): return c
+        raise ValueError(f"No column with '{key}' found")
+    
+    desc_a = detect_col(dfa, "desc")
+    alloc_col = detect_col(dfa, "alloc")
+    desc_b = detect_col(dfb, "desc")
+    inv_col = detect_col(dfb, "invent")
+    
+    # Precompute features
+    for df, desc_col in [(dfa, desc_a), (dfb, desc_b)]:
+        df["norm"] = df[desc_col].apply(norm_text)
+        df["strength"] = df[desc_col].apply(extract_strength)
+        df["form_family"] = df[desc_col].apply(detect_form_family)
+        df[["pack", "pack_complex"]] = df[desc_col].apply(lambda s: pd.Series(extract_pack(s)))
+        df["root"] = df["norm"].apply(primary_generic_root)
+    
+    # Apply safe int to numeric columns
+    dfa[alloc_col] = dfa[alloc_col].apply(safe_int)
+    dfb[inv_col] = dfb[inv_col].apply(safe_int)
 
-    dfb["Inventory"] = dfb["Inventory"].apply(safe_int)
-
-    # Pre-compute parsed features
-    dfa["norm"] = dfa["Description"].apply(norm_text)
-    dfa["strength"] = dfa["Description"].apply(extract_strength)
-    dfa["form_family"] = dfa["Description"].apply(detect_form_family)
-    dfa[["pack", "pack_complex"]] = dfa["Description"].apply(lambda s: pd.Series(extract_pack(s)))
-    dfa["root"] = dfa["Description"].apply(primary_generic_root)
-
-    dfb["norm"] = dfb["Description"].apply(norm_text)
-    dfb["strength"] = dfb["Description"].apply(extract_strength)
-    dfb["form_family"] = dfb["Description"].apply(detect_form_family)
-    dfb[["pack", "pack_complex"]] = dfb["Description"].apply(lambda s: pd.Series(extract_pack(s)))
-    dfb["root"] = dfb["Description"].apply(primary_generic_root)
-
+    used_indices = set()
     rows = []
 
     for idx, A in dfa.iterrows():
-        alloc = safe_int(A["Allocation"])
-        a_desc = A["Description"]
+        alloc = safe_int(A[alloc_col])
+        a_desc = A[desc_a]
         a_norm = A["norm"]
         a_root = A["root"]
         a_strength = A["strength"]
@@ -154,43 +150,36 @@ if file_allocation and file_inventory:
 
         remarks = []
 
-        # --- Candidate selection ---
+        # Candidate selection
         cand = dfb[
-            (dfb["Inventory"] > 0) &
+            (dfb[inv_col] > 0) &
             (dfb["form_family"] == a_formfam) &
             (dfb["strength"] == a_strength) &
             (dfb["root"] == a_root) &
-            (
-                (dfb["pack"] == a_pack) |
-                (pd.isna(dfb["pack"]) & pd.isna(a_pack))
-            ) &
-            (dfb["norm"].apply(lambda s: same_combo_pattern(a_norm, s)))
+            (dfb.index.map(lambda i: i not in used_indices)) &
+            ((dfb["pack"] == a_pack) | (dfb["pack"].isna() & pd.isna(a_pack)))
         ].copy()
 
-        # If combo product, leave for audit
         if is_combo_product(a_norm):
             rows.append([a_desc, alloc, 0, alloc, "Combo product; audit"])
             continue
 
-        # If multiple inventory matches, leave for audit
         if cand.shape[0] > 1:
             rows.append([a_desc, alloc, 0, alloc, "Multiple inventory matches; audit"])
             continue
 
-        # If no strict match, leave for audit
         if cand.empty:
             rows.append([a_desc, alloc, 0, alloc, "No match found"])
             continue
 
-        total_inventory_pieces = int(sum([safe_int(x) for x in cand["Inventory"]]))
+        total_inventory = int(sum([safe_int(x) for x in cand[inv_col]]))
 
-        # --- Exact vs Fuzzy match detection ---
+        # Exact vs fuzzy
         if any(cand["norm"] == a_norm):
             remarks.append("Exact Match")
         else:
             remarks.append("Alternatives found")
 
-        # --- Extra remarks from audit rules ---
         if any(cand["pack_complex"]) or a_complex:
             remarks.append("Audit pack: complex count")
         if any(cand["pack"].isna()) and a_formfam == "solid":
@@ -200,42 +189,40 @@ if file_allocation and file_inventory:
         if is_unclear_pack(a_desc):
             remarks.append("Unclear pack (Pwdr/Soln); needs checking")
 
-        # --- Remaining computation ---
         remaining = 0
         if a_formfam == "solid":
             if a_pack is None:
                 remaining = alloc
                 remarks.append("Check pack size")
             else:
-                need_float = alloc - (float(total_inventory_pieces) / float(a_pack))
+                need_float = alloc - (float(total_inventory) / float(a_pack))
                 need_float = max(0.0, need_float)
                 remaining = round_half_up(need_float)
         else:
-            need_float = alloc - float(total_inventory_pieces)
+            need_float = alloc - float(total_inventory)
             need_float = max(0.0, need_float)
             remaining = round_half_up(need_float)
 
-        if remaining < 0:
-            remaining = 0
+        if remaining < 0: remaining = 0
+
+        # Mark used indices so inventory is not double-counted
+        for i in cand.index: used_indices.add(i)
 
         remarks_str = "; ".join(sorted(set(remarks))) if remarks else ""
-        rows.append([a_desc, alloc, total_inventory_pieces, remaining, remarks_str])
+        rows.append([a_desc, alloc, total_inventory, remaining, remarks_str])
 
-    out = pd.DataFrame(rows, columns=["Description", "Allocation", "Inventory", "Remaining", "Remarks"])
-
+    out = pd.DataFrame(rows, columns=["Description", "Allocation", "Inventory", "Ordering", "Remarks"])
     st.success("✅ Processing complete!")
-
-    # Preview
     st.dataframe(out)
 
     # Download
     buffer = io.BytesIO()
     out.to_excel(buffer, index=False)
     buffer.seek(0)
-
     st.download_button(
         label="📥 Download Output Excel",
         data=buffer,
         file_name="output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+    
